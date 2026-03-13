@@ -1,14 +1,16 @@
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
+Pkg.Registry.add("General")
 Pkg.Registry.add(Pkg.RegistrySpec(url="https://github.com/MurrellGroup/MurrellGroupRegistry"))
 Pkg.add(url="https://github.com/HedwigNordlinder/Jester.jl")
-Pkg.add(["Flowfusion", "ForwardBackward", "Flux", "RandomFeatureMaps", "Distributions", "StatsBase", "Plots", "CannotWaitForTheseOptimisers", "Onion"])
+Pkg.add(["Flowfusion", "ForwardBackward", "Flux", "RandomFeatureMaps", "Distributions", "StatsBase", "Plots", "CannotWaitForTheseOptimisers", "Onion", "CUDA"])
 Pkg.instantiate()
 
 using Flux, Flowfusion, ForwardBackward, RandomFeatureMaps, StatsBase, Plots
 using CannotWaitForTheseOptimisers, Distributions, LinearAlgebra, Jester, Onion
 using ColoumbBenchmark
-using ProgressMeter
+using ProgressMeter, CUDA, cuDNN
+CUDA.device!(0)
 T = Float32
 n_particles = 8
 β = T(2.0)
@@ -62,7 +64,7 @@ end
 P = BrownianMotion(T(0.15))
 embedding_dim = 256
 n_transformers = 2
-model = EnergyBasedModel(embedding_dim, n_transformers)
+model = EnergyBasedModel(embedding_dim, n_transformers) |> gpu
 opt_state = Flux.setup(Muon(), model)
 
 n_samples = 1024
@@ -75,13 +77,17 @@ losses = T[]
     t = rand(T, n_samples)
     Xt = bridge(P, X0, X1, t)
 
+    Xt_gpu = gpu(tensor(Xt))
+    X1_gpu = ContinuousState(gpu(tensor(X1)))
+    t_gpu = gpu(t)
+
     loss, grad = Flux.withgradient(model) do m
         θ, re = Flux.destructure(m)
-        energy_fn = (x, θ) -> sum(re(θ)(t, x))
-        score = grad_fd(energy_fn, tensor(Xt), θ)
-        t_scale = reshape(T(1.05) .- t, 1, 1, :)
-        X̂₁ = ContinuousState(tensor(Xt) .+ score .* t_scale)
-        floss(P, X̂₁, X1, scalefloss(P, t))
+        energy_fn = (x, θ) -> sum(re(θ)(t_gpu, x))
+        score = grad_fd(energy_fn, Xt_gpu, θ)
+        t_scale = reshape(T(1.05) .- t_gpu, 1, 1, :)
+        X̂₁ = ContinuousState(Xt_gpu .+ score .* t_scale)
+        floss(P, X̂₁, X1_gpu, scalefloss(P, t_gpu))
     end
 
     Flux.update!(opt_state, model, grad[1])
@@ -96,13 +102,13 @@ end
 
 function gen_model(t, Xt)
     θ, re = Flux.destructure(model)
-    x = tensor(Xt)
+    x = gpu(tensor(Xt))
     n_batch = size(x, 3)
-    t_vec = fill(T(t), n_batch)
+    t_vec = fill!(similar(x, n_batch), T(t))
     energy_fn = (x, θ) -> sum(re(θ)(t_vec, x))
     score = grad_fd(energy_fn, x, θ)
     t_scale = T(1.05) - T(t)
-    ContinuousState(x .+ score .* t_scale)
+    ContinuousState(cpu(x .+ score .* t_scale))
 end
 
 n_gen = 500
@@ -122,7 +128,7 @@ p2 = plot(title="Particle Trajectories", xlabel="Time", ylabel="Position")
 n_show = min(20, n_gen)
 for sample_idx in 1:n_show
     for particle_idx in 1:n_particles
-        positions = [tensor(s[1])[1, particle_idx, sample_idx] for s in paths.xt]
+        positions = [cpu(tensor(s[1]))[1, particle_idx, sample_idx] for s in paths.xt]
         times = paths.t[1:length(positions)]
         plot!(p2, times, positions, alpha=0.3, label=nothing, color=particle_idx, lw=0.5)
     end
@@ -131,7 +137,7 @@ savefig(p2, joinpath(@__DIR__, "trajectories.png"))
 
 # 3. Distribution comparison
 true_samples = sample_X1(5000)
-gen_positions = tensor(samples)
+gen_positions = cpu(tensor(samples))
 
 p3 = plot(title="Generated vs True Coulomb Gas", xlabel="Position", ylabel="Density")
 histogram!(p3, vec(true_samples), normalize=:pdf, alpha=0.5, label="True CoulombGas", bins=80)
