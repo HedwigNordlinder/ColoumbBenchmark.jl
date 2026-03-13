@@ -3,20 +3,22 @@ Pkg.activate(joinpath(@__DIR__, ".."))
 Pkg.Registry.add("General")
 Pkg.Registry.add(Pkg.RegistrySpec(url="https://github.com/MurrellGroup/MurrellGroupRegistry"))
 Pkg.add(url="https://github.com/HedwigNordlinder/Jester.jl")
-Pkg.add(["Flowfusion", "ForwardBackward", "Flux", "RandomFeatureMaps", "Distributions", "StatsBase", "Plots", "CannotWaitForTheseOptimisers", "Onion", "CUDA"])
+Pkg.add(["Flowfusion", "ForwardBackward", "Flux", "RandomFeatureMaps", "Distributions", "StatsBase", "Plots", "Onion", "CUDA"])
 Pkg.instantiate()
 
 using Flux, Flowfusion, ForwardBackward, RandomFeatureMaps, StatsBase, Plots
-using CannotWaitForTheseOptimisers, Distributions, LinearAlgebra, Jester, Onion
+using Distributions, LinearAlgebra, Jester, Onion
 using ColoumbBenchmark
 using ProgressMeter, CUDA, cuDNN
 CUDA.device!(0)
 T = Float32
-n_particles = 8
-β = T(2.0)
+n_particles = 100
+βs = T[1.0, 2.0, 4.0]
+locations = [-10, 0, 10]
+coulomb_mixture = MixtureModel([CoulombGas(n_particles, βs[i], locations[i] .* ones(n_particles)) for i in eachindex(locations)])
 
-sample_X1(n::Int) = reshape(T.(rand(CoulombGas(n_particles, β), n)), 1, n_particles, :)
-sample_X0(n::Int) = sort(reshape(T.(rand(MvNormal(fill(-2.0, n_particles), I(n_particles)), n)), 1, n_particles, :), dims=2)
+sample_X1(n::Int) = reshape(T.(rand(coulomb_mixture, n)), 1, n_particles, :)
+sample_X0(n::Int) = sort(reshape(T.(rand(MvNormal(fill(0, n_particles), I(n_particles)), n)), 1, n_particles, :), dims=2)
 
 # --- Energy-based model ---
 
@@ -42,7 +44,6 @@ function EnergyBasedModel(embedding_dim::Int, n_transformers::Int)
 end
 
 function (m::EnergyBasedModel)(t, x)
-    # x: (1, n_particles, batch), t: (batch,)
     layers = m.layers
     loc_features = vcat(
         layers.location_rff(x),
@@ -56,22 +57,39 @@ function (m::EnergyBasedModel)(t, x)
     for layer in layers.transformers
         h = layer(h; cond=t_cond)
     end
-    return layers.energy_decoder(h)  # (1, n_particles, batch)
+    h_pool = mean(h, dims=2)  
+    return layers.energy_decoder(h_pool)  
 end
 
 # --- Training ---
 
 P = BrownianMotion(T(0.15))
 embedding_dim = 256
-n_transformers = 2
+n_transformers = 5
 model = EnergyBasedModel(embedding_dim, n_transformers) |> gpu
-opt_state = Flux.setup(Muon(), model)
 
+# --- Learning rate schedule: linear warmup + cosine decay ---
+peak_lr = T(1e-3)
+warmup_iters = 100
+n_iters = 8000
 n_samples = 1024
-n_iters = 1000
+
+function lr_schedule(iter)
+    if iter <= warmup_iters
+        return peak_lr * iter / warmup_iters
+    else
+        progress = (iter - warmup_iters) / (n_iters - warmup_iters)
+        return peak_lr * T(0.5) * (1 + cos(T(π) * progress))
+    end
+end
+
+opt_state = Flux.setup(AdamW(peak_lr, (0.9, 0.999), 1e-2), model)
 losses = T[]
 
 @showprogress for i in 1:n_iters
+    # Update learning rate
+    Flux.adjust!(opt_state, T(lr_schedule(i)))
+
     X0 = ContinuousState(sample_X0(n_samples))
     X1 = ContinuousState(sample_X1(n_samples))
     t = rand(T, n_samples)
@@ -94,7 +112,7 @@ losses = T[]
     push!(losses, loss)
 
     if i % 100 == 0
-        println("Iter $i / $n_iters, loss: $(round(loss; digits=4))")
+        println("Iter $i / $n_iters, loss: $(round(loss; digits=4)), lr: $(round(lr_schedule(i); sigdigits=4))")
     end
 end
 
@@ -123,25 +141,49 @@ samples = gen(P, X0_gen, gen_model, steps; tracker=paths)
 p1 = plot(losses, xlabel="Iteration", ylabel="Loss", title="Training Loss", label=nothing, lw=1.5)
 savefig(p1, joinpath(@__DIR__, "loss_curve.png"))
 
-# 2. Particle trajectories
-p2 = plot(title="Particle Trajectories", xlabel="Time", ylabel="Position")
-n_show = min(20, n_gen)
-for sample_idx in 1:n_show
-    for particle_idx in 1:n_particles
-        positions = [cpu(tensor(s[1]))[1, particle_idx, sample_idx] for s in paths.xt]
-        times = paths.t[1:length(positions)]
-        plot!(p2, times, positions, alpha=0.3, label=nothing, color=particle_idx, lw=0.5)
-    end
+# 2. Evolution GIF for a single sample
+sample_idx = 1
+snapshots = paths.xt
+snap_times = paths.t[1:length(snapshots)]
+xlims_range = let all_pos = vcat([cpu(tensor(s[1]))[1, :, sample_idx] for s in snapshots]...)
+    (minimum(all_pos) - 1.0, maximum(all_pos) + 1.0)
 end
-savefig(p2, joinpath(@__DIR__, "trajectories.png"))
 
-# 3. Distribution comparison
+anim = @animate for (k, s) in enumerate(snapshots)
+    pos = cpu(tensor(s[1]))[1, :, sample_idx]
+    scatter(pos, zeros(T, n_particles),
+        xlims=xlims_range, ylims=(-0.5, 0.5),
+        xlabel="Position", title="t = $(round(snap_times[k]; digits=3))",
+        label=nothing, markersize=6, markerstrokewidth=0,
+        yticks=[], size=(600, 200))
+    vline!([locations...], linestyle=:dash, alpha=0.3, label=nothing, color=:gray)
+end
+gif(anim, joinpath(@__DIR__, "evolution.gif"), fps=30)
+
+# 3. Distribution comparison: per-component marginals
 true_samples = sample_X1(5000)
 gen_positions = cpu(tensor(samples))
 
-p3 = plot(title="Generated vs True Coulomb Gas", xlabel="Position", ylabel="Density")
-histogram!(p3, vec(true_samples), normalize=:pdf, alpha=0.5, label="True CoulombGas", bins=80)
-histogram!(p3, vec(gen_positions), normalize=:pdf, alpha=0.5, label="Generated", bins=80)
+p3 = plot(title="Mixture of Shifted Coulomb Laws", xlabel="Position", ylabel="Density",
+    size=(800, 400))
+histogram!(p3, vec(true_samples), normalize=:pdf, alpha=0.4, label="True (mixture)", bins=100, color=:blue)
+histogram!(p3, vec(gen_positions), normalize=:pdf, alpha=0.4, label="Generated", bins=100, color=:orange)
+vline!(p3, [locations...], linestyle=:dash, alpha=0.5, label="Component centers", color=:black, lw=1.5)
 savefig(p3, joinpath(@__DIR__, "distribution_comparison.png"))
+
+# 4. Per-particle trajectory plot (overlay multiple samples)
+n_show = min(50, n_gen)
+p4 = plot(title="Particle Trajectories ($(n_show) samples)", xlabel="t", ylabel="Position",
+    size=(800, 500), legend=:outertopright)
+colors = palette(:tab10)
+for si in 1:n_show
+    for pi in 1:n_particles
+        traj = [cpu(tensor(s[1]))[1, pi, si] for s in snapshots]
+        plot!(p4, snap_times, traj, alpha=0.15, color=colors[(pi-1) % length(colors) + 1],
+            label=(si == 1 ? "Particle $pi" : nothing), lw=0.5)
+    end
+end
+hline!(p4, T.(locations), linestyle=:dash, alpha=0.5, label="Centers", color=:black, lw=1.5)
+savefig(p4, joinpath(@__DIR__, "trajectories.png"))
 
 println("Done! Plots saved to examples/")
